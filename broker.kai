@@ -1,0 +1,69 @@
+#[doc("""
+The two pieces of state the server shares between connection fibers,
+each owned by one actor: the gate that bounds how many jobs run at
+once, and the cache of finished responses.
+""")]
+
+import actor
+
+import collections.map as cmap
+
+#[doc("What a connection fiber hears back from the gate or the cache.")]
+pub type Reply = Granted | Busy | Hit(String) | Miss
+
+pub type GateMsg = Acquire(Pid[Reply]) | Release
+
+pub type CacheMsg = Lookup(String, Pid[Reply]) | Store(String, String)
+
+#[doc("""
+Counting semaphore with a bounded waiting line. `Acquire` answers
+`Granted` at once while a slot is free, queues the caller while the
+line has room, and answers `Busy` otherwise. Every `Granted` must be
+paired with one `Release`.
+""")]
+pub fn gate(slots: Int, max_waiting: Int) : Unit / Actor[GateMsg] =
+  gate_loop(slots, [], max_waiting)
+
+fn gate_loop(free: Int, waiting: [Pid[Reply]], max_waiting: Int) : Unit / Actor[GateMsg] =
+  match Actor.receive() {
+    Acquire(who) ->
+      if free > 0 {
+        Actor.send(who, Granted)
+        gate_loop(free - 1, waiting, max_waiting)
+      } else if waiting.length() >= max_waiting {
+        Actor.send(who, Busy)
+        gate_loop(free, waiting, max_waiting)
+      } else {
+        gate_loop(free, waiting ++ [who], max_waiting)
+      }
+    Release -> match waiting {
+      [] -> gate_loop(free + 1, waiting, max_waiting)
+      [next, ...rest] -> {
+        Actor.send(next, Granted)
+        gate_loop(free, rest, max_waiting)
+      }
+    }
+  }
+
+#[doc("""
+Response cache keyed by the hash of the submitted source. It holds at
+most `capacity` entries and starts over when it fills up.
+""")]
+pub fn cache(capacity: Int) : Unit / Actor[CacheMsg] = cache_loop(cmap.empty(), capacity)
+
+fn cache_loop(entries: cmap.Map[String, String], capacity: Int) : Unit / Actor[CacheMsg] =
+  match Actor.receive() {
+    Lookup(key, who) -> {
+      match cmap.get(entries, key) {
+        Some(body) -> Actor.send(who, Hit(body))
+        None -> Actor.send(who, Miss)
+      }
+      cache_loop(entries, capacity)
+    }
+    Store(key, body) ->
+      if cmap.size(entries) >= capacity {
+        cache_loop(cmap.put(cmap.empty(), key, body), capacity)
+      } else {
+        cache_loop(cmap.put(entries, key, body), capacity)
+      }
+  }

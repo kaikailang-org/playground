@@ -1,0 +1,10 @@
+# Ubuntu 24.04 denies user namespaces to unprivileged programs unless a
+# profile grants them. This one lets bubblewrap create its sandbox.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}

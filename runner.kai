@@ -1,0 +1,225 @@
+#[doc("""
+Runs one submission: writes the source into a fresh job directory,
+compiles it, and runs the binary. Every child process goes through the
+launcher script, which decides how isolated it is, and is killed when
+it outlives its deadline or prints more than the output cap.
+""")]
+
+import time
+
+import spawn
+
+import uuid
+
+pub type Limits = { build_secs: Int, run_secs: Int, max_output: Int }
+
+pub type Tools = { launcher: String, kai: String, workdir: String }
+
+#[doc("How a child process ended.")]
+pub type Stop = Finished(Int) | TimedOut | TooMuchOutput | Killed(Int) | Failed(String)
+
+pub type Outcome = { out: String, stop: Stop }
+
+#[doc("""
+The result of a submission. `errors` is the compiler's report when the
+build failed; `output` is what the program printed. `reason` is empty
+for a program that ran to completion.
+""")]
+pub type JobResult = {
+  errors: String,
+  output: String,
+  status: Int,
+  reason: String,
+  cacheable: Bool
+}
+
+const SIGKILL : Int = 9
+
+fn drain(c: Child, acc: String, limit: Int) : Pair[String, Bool] / Process =
+  match Process.read_stdout(c) {
+    Err(_) -> (acc, false)
+    Ok(chunk) ->
+      if string_length(chunk) == 0 {
+        (acc, false)
+      } else if string_length(acc) + string_length(chunk) > limit {
+        let _ = Process.kill_group(c, SIGKILL)
+        (acc ++ string_slice(chunk, 0, limit - string_length(acc)), true)
+      } else {
+        drain(c, acc ++ chunk, limit)
+      }
+  }
+
+#[doc("""
+Run `cmd` in its own process group, collecting its stdout up to
+`max_output` bytes and killing the whole group after `secs` seconds.
+""")]
+pub fn run_limited(
+  cmd: String,
+  args: [String],
+  secs: Int,
+  max_output: Int
+) : Outcome / Process + Spawn + Clock {
+  let started = monotonic()
+  match Process.start_group(cmd, args, false, true, false) {
+    Err(e) -> Outcome { out: "", stop: Failed(e) }
+    Ok(c) -> nursery { n ->
+      let watchdog = n.spawn(() => {
+        sleep(seconds(secs))
+        let _ = Process.kill_group(c, SIGKILL)
+        ()
+      })
+      let (out, overflowed) = drain(c, "", max_output)
+      let status = Process.wait(c)
+      n.cancel(watchdog)
+      let took = duration_to_nanos(elapsed_since(started, monotonic()))
+      let stop = match status {
+        Err(e) -> Failed(e)
+        Ok(Exited(code)) -> Finished(code)
+        Ok(Signaled(sig)) ->
+          if overflowed {
+            TooMuchOutput
+          } else if took >= secs * 1_000_000_000 {
+            TimedOut
+          } else {
+            Killed(sig)
+          }
+      }
+      Outcome { out: out, stop: stop }
+    }
+  }
+}
+
+fn launch(
+  t: Tools,
+  dir: String,
+  mode: String,
+  cmd: [String],
+  secs: Int,
+  max_output: Int
+) : Outcome / Process + Spawn + Clock =
+  run_limited(t.launcher, [dir, mode, ...cmd], secs, max_output)
+
+fn new_job(t: Tools, source: String) : Result[String, String] / File + Random {
+  let dir = "#{t.workdir}/job-#{uuid.v4()}"
+  match dir_create_dir(dir) {
+    Err(e) -> Err("cannot create job directory: #{e}")
+    Ok(_) -> match File.write_file("#{dir}/main.kai", source) {
+      Err(e) -> Err("cannot write source: #{e}")
+      Ok(_) -> Ok(dir)
+    }
+  }
+}
+
+fn discard(t: Tools, dir: String) : Unit / Process + Spawn + Clock {
+  let _ = launch(t, dir, "clean", [], 10, 1024)
+  ()
+}
+
+# The compiler prints the path it was given; the reader only ever saw
+# `main.kai`.
+fn hide_paths(text: String, dir: String) : String = text.replace("#{dir}/", "").replace("/job/", "")
+
+fn internal(msg: String) : JobResult = JobResult {
+  errors: "playground: #{msg}",
+  output: "",
+  status: -1,
+  reason: "internal",
+  cacheable: false
+}
+
+fn build_failed(o: Outcome, dir: String) : Option[JobResult] = match o.stop {
+  Finished(0) -> None
+  Finished(code) -> Some(JobResult {
+    errors: hide_paths(o.out, dir),
+    output: "",
+    status: code,
+    reason: "",
+    cacheable: true
+  })
+  TimedOut -> Some(JobResult {
+    errors: "",
+    output: "",
+    status: -1,
+    reason: "build_timeout",
+    cacheable: false
+  })
+  TooMuchOutput -> Some(JobResult {
+    errors: hide_paths(o.out, dir),
+    output: "",
+    status: -1,
+    reason: "output_limit",
+    cacheable: true
+  })
+  Killed(_) ->
+    Some(JobResult { errors: "", output: "", status: -1, reason: "build_killed", cacheable: false })
+  Failed(e) -> Some(internal(e))
+}
+
+# A sandbox reports a program killed inside it as exit status 128 + 9,
+# since the launcher itself was not the one signalled.
+fn ran(o: Outcome) : JobResult = match o.stop {
+  Finished(137) ->
+    JobResult { errors: "", output: o.out, status: 137, reason: "killed", cacheable: false }
+  Finished(code) ->
+    JobResult { errors: "", output: o.out, status: code, reason: "", cacheable: true }
+  TimedOut ->
+    JobResult { errors: "", output: o.out, status: -1, reason: "timeout", cacheable: false }
+  TooMuchOutput ->
+    JobResult { errors: "", output: o.out, status: -1, reason: "output_limit", cacheable: true }
+  Killed(sig) ->
+    JobResult { errors: "", output: o.out, status: 128 + sig, reason: "killed", cacheable: false }
+  Failed(e) -> internal(e)
+}
+
+#[doc("Compile `source` and run the resulting program.")]
+pub fn compile_and_run(
+  t: Tools,
+  lim: Limits,
+  source: String
+) : JobResult / File + Random + Process + Spawn + Clock = match new_job(t, source) {
+  Err(e) -> internal(e)
+  Ok(dir) -> {
+    let built = launch(
+      t,
+      dir,
+      "build",
+      [t.kai, "build", "main.kai", "-o", "prog"],
+      lim.build_secs,
+      lim.max_output
+    )
+    let result = match build_failed(built, dir) {
+      Some(failure) -> failure
+      None -> ran(launch(t, dir, "run", ["./prog"], lim.run_secs, lim.max_output))
+    }
+    discard(t, dir)
+    result
+  }
+}
+
+#[doc("Format `source` with `kai fmt`; `Err` carries the parser's report.")]
+pub fn format(
+  t: Tools,
+  lim: Limits,
+  source: String
+) : Result[String, String] / File + Random + Process + Spawn + Clock = match new_job(t, source) {
+  Err(e) -> Err("playground: #{e}")
+  Ok(dir) -> {
+    let o = launch(t, dir, "build", [t.kai, "fmt", "main.kai"], lim.build_secs, lim.max_output)
+    let result = match o.stop {
+      Finished(0) -> File.read_file("#{dir}/main.kai")
+      Finished(_) -> Err(hide_paths(o.out, dir))
+      _ -> Err("playground: the formatter did not finish")
+    }
+    discard(t, dir)
+    result
+  }
+}
+
+#[doc("The toolchain's version line, or `unknown` when it cannot be asked.")]
+pub fn toolchain_version(t: Tools) : String / Process + Spawn + Clock {
+  let o = run_limited(t.kai, ["--version"], 10, 4096)
+  match (o.stop, o.out.lines()) {
+    (Finished(0), [first, ..._]) -> first.trim()
+    _ -> "unknown"
+  }
+}

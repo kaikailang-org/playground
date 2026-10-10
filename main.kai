@@ -1,0 +1,287 @@
+#[doc("""
+The kaikai playground server. It listens for plain HTTP on the loopback
+interface, behind a reverse proxy that terminates TLS and rate-limits
+by address, and serves three calls:
+
+  POST /api/compile   {"body": source}  ->  compile and run it
+  POST /api/fmt       {"body": source}  ->  format it
+  GET  /api/version                     ->  the toolchain in use
+
+Each connection runs on its own fiber. A job waits its turn at the
+gate, so at most `WORKERS` compile at once, and a finished response is
+remembered by the hash of its source.
+""")]
+
+import net.tcp
+
+import net.http
+
+import actor
+
+import spawn
+
+import crypto.hash
+
+import encoding.hex
+
+import encoding.json
+
+import encoding.json_bind
+
+import time
+
+import playground.broker
+
+import playground.runner
+
+const WORKERS : Int = 4
+
+const MAX_WAITING : Int = 8
+
+const MAX_CONNECTIONS : Int = 64
+
+const CACHE_ENTRIES : Int = 256
+
+const MAX_SOURCE_BYTES : Int = 65536
+
+# Room for the source once JSON-escaped, plus the request head.
+const MAX_REQUEST_BYTES : Int = 200000
+
+type Server = {
+  tools: Tools,
+  limits: Limits,
+  version: String,
+  gate: Pid[GateMsg],
+  cache: Pid[CacheMsg]
+}
+
+type ConnMsg = | ConnDone
+
+# ---- responses -----------------------------------------------------
+
+fn respond(status: Int, body: JsonValue, extra: [http.HttpHeader]) : http.Response = http.Response {
+  status: status,
+  headers: [
+    http.HttpHeader { name: "Content-Type", value: "application/json; charset=utf-8" },
+    http.HttpHeader { name: "Cache-Control", value: "no-store" },
+    http.HttpHeader { name: "Connection", value: "close" },
+    ...extra
+  ],
+  body: json_encode(body)
+}
+
+fn raw_json(status: Int, body: String) : http.Response = http.Response {
+  status: status,
+  headers: [
+    http.HttpHeader { name: "Content-Type", value: "application/json; charset=utf-8" },
+    http.HttpHeader { name: "Cache-Control", value: "no-store" },
+    http.HttpHeader { name: "Connection", value: "close" }
+  ],
+  body: body
+}
+
+fn failure(status: Int, msg: String) : http.Response =
+  respond(status, JObj([("error", JStr(msg))]), [])
+
+fn busy() : http.Response = respond(
+  503,
+  JObj([("error", JStr("the playground is busy; try again in a moment"))]),
+  [http.HttpHeader { name: "Retry-After", value: "5" }]
+)
+
+fn job_json(r: JobResult) : String {
+  let events = if string_length(r.output) == 0 {
+    []
+  } else {
+    [JObj([("kind", JStr("stdout")), ("message", JStr(r.output)), ("delay", JNum(0))])]
+  }
+  json_encode(
+    JObj([
+      ("errors", JStr(r.errors)),
+      ("events", JArr(events)),
+      ("status", JNum(r.status)),
+      ("reason", JStr(r.reason))
+    ])
+  )
+}
+
+# ---- handlers ------------------------------------------------------
+
+fn source_of(req: http.Request) : Result[String, http.Response] = match json_decode(req.body) {
+  None -> Err(failure(400, "the request body is not JSON"))
+  Some(v) -> match as_string(get(v, "body")) {
+    None -> Err(failure(400, "the request has no \"body\" string"))
+    Some(src) ->
+      if string_length(src) > MAX_SOURCE_BYTES {
+        Err(failure(413, "the program is too large"))
+      } else {
+        Ok(src)
+      }
+  }
+}
+
+fn compile(
+  s: Server,
+  src: String
+) : http.Response / Actor[Reply] + File + Random + Process + Spawn + Clock {
+  let key = hex.encode(sha256(http.string_to_bytes(src)))
+  Actor.send(s.cache, Lookup(key, Actor.self()))
+  match Actor.receive() {
+    Hit(body) -> raw_json(200, body)
+    _ -> {
+      Actor.send(s.gate, Acquire(Actor.self()))
+      match Actor.receive() {
+        Granted -> {
+          let r = compile_and_run(s.tools, s.limits, src)
+          Actor.send(s.gate, Release)
+          let body = job_json(r)
+          if r.cacheable {
+            Actor.send(s.cache, Store(key, body))
+          }
+          raw_json(200, body)
+        }
+        _ -> busy()
+      }
+    }
+  }
+}
+
+fn fmt(
+  s: Server,
+  src: String
+) : http.Response / Actor[Reply] + File + Random + Process + Spawn + Clock {
+  Actor.send(s.gate, Acquire(Actor.self()))
+  match Actor.receive() {
+    Granted -> {
+      let r = format(s.tools, s.limits, src)
+      Actor.send(s.gate, Release)
+      match r {
+        Ok(formatted) -> respond(200, JObj([("body", JStr(formatted)), ("error", JStr(""))]), [])
+        Err(e) -> respond(200, JObj([("body", JStr("")), ("error", JStr(e))]), [])
+      }
+    }
+    _ -> busy()
+  }
+}
+
+fn route(
+  s: Server,
+  req: http.Request
+) : http.Response / Actor[Reply] + File + Random + Process + Spawn + Clock = match (
+  req.method,
+  req.url
+) {
+  ("POST", "/api/compile") -> match source_of(req) {
+    Err(resp) -> resp
+    Ok(src) -> compile(s, src)
+  }
+  ("POST", "/api/fmt") -> match source_of(req) {
+    Err(resp) -> resp
+    Ok(src) -> fmt(s, src)
+  }
+  ("GET", "/api/version") -> respond(200, JObj([("version", JStr(s.version))]), [])
+  ("GET", "/healthz") -> respond(200, JObj([("ok", JBool(true))]), [])
+  (_, "/api/compile") -> failure(405, "use POST")
+  (_, "/api/fmt") -> failure(405, "use POST")
+  _ -> failure(404, "not found")
+}
+
+# ---- connections ---------------------------------------------------
+
+fn send_all(c: Conn, data: [Int]) : Unit / NetTcp = match data {
+  [] -> ()
+  _ -> match NetTcp.send(c, data) {
+    Err(_) -> ()
+    Ok(n) ->
+      if n <= 0 {
+        ()
+      } else {
+        send_all(c, list.drop(data, n))
+      }
+  }
+}
+
+fn serve_conn(
+  s: Server,
+  c: Conn
+) : Unit / Actor[Reply] + NetTcp + Stdout + File + Random + Process + Spawn + Clock {
+  let resp = match http.read_request(c, MAX_REQUEST_BYTES) {
+    Err(_) -> failure(400, "bad request")
+    Ok(req) -> {
+      let r = route(s, req)
+      Stdout.print("#{req.method} #{req.url} #{r.status}")
+      r
+    }
+  }
+  send_all(c, http.string_to_bytes(http.serialize_response(resp)))
+  NetTcp.close(c)
+}
+
+fn drain_done(live: Int) : Int / Actor[ConnMsg] = match Actor.receive_timeout(0) {
+  None -> live
+  Some(ConnDone) -> drain_done(live - 1)
+}
+
+fn accept_loop(s: Server, l: Listener, live: Int) : Unit / Actor[ConnMsg] + NetTcp + Spawn =
+  match NetTcp.accept(l) {
+    Err(_) -> accept_loop(s, l, live)
+    Ok(c) -> {
+      let n = drain_done(live)
+      if n >= MAX_CONNECTIONS {
+        NetTcp.close(c)
+        accept_loop(s, l, n)
+      } else {
+        let me = Actor.self()
+        let _ = spawn_actor(() => {
+          serve_conn(s, c)
+          Actor.send(me, ConnDone)
+        })
+        accept_loop(s, l, n + 1)
+      }
+    }
+  }
+
+# ---- startup -------------------------------------------------------
+
+fn setting(name: String, fallback: String) : String / Env = match Env.get(name) {
+  Some(v) -> if string_length(v) == 0 { fallback } else { v }
+  None -> fallback
+}
+
+fn int_setting(name: String, fallback: Int) : Int / Env = match string_to_int(setting(name, "")) {
+  Some(n) -> n
+  None -> fallback
+}
+
+fn main() : Int / Stdout + Env + NetTcp + Spawn + Process + Clock + File + Random {
+  let tools = Tools {
+    launcher: setting("PLAYGROUND_LAUNCHER", "sandbox/none.sh"),
+    kai: setting("PLAYGROUND_KAI", "kai"),
+    workdir: setting("PLAYGROUND_WORKDIR", "/tmp/kaikai-playground")
+  }
+  let limits = Limits {
+    build_secs: int_setting("PLAYGROUND_BUILD_SECS", 10),
+    run_secs: int_setting("PLAYGROUND_RUN_SECS", 5),
+    max_output: int_setting("PLAYGROUND_MAX_OUTPUT", 65536)
+  }
+  let port = int_setting("PLAYGROUND_PORT", 8090)
+  match NetTcp.listen("127.0.0.1", port) {
+    Err(e) -> {
+      Stdout.print("listen 127.0.0.1:#{port}: #{e}")
+      1
+    }
+    Ok(l) -> nursery { n ->
+      let version = toolchain_version(tools)
+      let server = Server {
+        tools: tools,
+        limits: limits,
+        version: version,
+        gate: spawn_actor(() => gate(WORKERS, MAX_WAITING)),
+        cache: spawn_actor(() => cache(CACHE_ENTRIES))
+      }
+      Stdout.print("playground on 127.0.0.1:#{port}, #{version}")
+      with_mailbox(() => accept_loop(server, l, 0))
+      0
+    }
+  }
+}

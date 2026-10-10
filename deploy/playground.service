@@ -1,0 +1,35 @@
+[Unit]
+Description=kaikai playground
+After=network.target
+
+[Service]
+User=playground
+WorkingDirectory=/opt/kaikai-playground
+ExecStart=/opt/kaikai-playground/playground
+Environment=PLAYGROUND_PORT=8090
+Environment=PLAYGROUND_LAUNCHER=/opt/kaikai-playground/sandbox/bwrap.sh
+Environment=PLAYGROUND_KAI_HOME=/opt/kaikai
+Environment=PLAYGROUND_KAI=kai
+Environment=PLAYGROUND_WORKDIR=/tmp/kaikai-playground
+Environment=PATH=/opt/kaikai/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/mkdir -p /tmp/kaikai-playground
+# A trap in the server ends the process; come back at once.
+Restart=always
+RestartSec=1
+
+# The budget every job shares. A program that eats memory is killed by
+# the kernel inside this cgroup instead of hurting the host, and the
+# server keeps running: without OOMPolicy=continue systemd would stop
+# the whole unit along with it.
+MemoryMax=2G
+OOMPolicy=continue
+MemorySwapMax=0
+TasksMax=512
+CPUQuota=400%
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
