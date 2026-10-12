@@ -6,6 +6,8 @@
 #
 # site-config is the nginx file whose server block should serve /api/
 # (default: /etc/nginx/sites-enabled/kaikai-lang.org). Safe to run again.
+#
+# UPGRADE_KAI=1 also moves the toolchain to its latest release first.
 set -eu
 
 site=${1:-/etc/nginx/sites-enabled/kaikai-lang.org}
@@ -17,11 +19,6 @@ app=/opt/kaikai-playground
 
 echo "==> bubblewrap"
 command -v bwrap >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q bubblewrap
-if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] &&
-   [ ! -e /etc/apparmor.d/bwrap ]; then
-  install -m 644 "$src/deploy/apparmor-bwrap" /etc/apparmor.d/bwrap
-  apparmor_parser -r /etc/apparmor.d/bwrap
-fi
 
 echo "==> kaikai toolchain in $kai_home"
 if [ ! -x "$kai_home/bin/kai" ]; then
@@ -32,11 +29,32 @@ if [ ! -x "$kai_home/bin/kai" ]; then
     HOME="$scratch" SHELL=/bin/sh KAIKAI_HOME="$kai_home" sh
   rm -rf "$scratch"
 fi
+if [ "${UPGRADE_KAI:-0}" = 1 ]; then
+  scratch=$(mktemp -d)
+  HOME="$scratch" KAIKAI_HOME="$kai_home" "$kai_home/bin/kai" upgrade
+  rm -rf "$scratch"
+fi
 "$kai_home/bin/kai" --version
 
 echo "==> service user"
 id playground >/dev/null 2>&1 ||
   useradd --system --home-dir "$app" --shell /usr/sbin/nologin playground
+
+echo "==> private copy of bubblewrap"
+# Only this copy is allowed to create user namespaces, and only the
+# playground group may run it, so the rest of the host keeps Ubuntu's
+# restriction on /usr/bin/bwrap.
+mkdir -p "$app/bin"
+install -o root -g playground -m 750 "$(command -v bwrap)" "$app/bin/bwrap"
+if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+  install -m 644 "$src/deploy/apparmor-bwrap" /etc/apparmor.d/kaikai-playground-bwrap
+  apparmor_parser -r /etc/apparmor.d/kaikai-playground-bwrap
+fi
+# Earlier versions of this script opened /usr/bin/bwrap to everyone.
+if grep -qs 'lets bubblewrap create its sandbox' /etc/apparmor.d/bwrap; then
+  apparmor_parser -R /etc/apparmor.d/bwrap || true
+  rm -f /etc/apparmor.d/bwrap
+fi
 
 echo "==> build"
 # Imports resolve through the directory name, so it must be the package's.
@@ -74,7 +92,9 @@ fn main() {
 }
 KAI
 chown playground "$job/main.kai"
-as_playground() { runuser -u playground -- env PLAYGROUND_KAI_HOME="$kai_home" "$@"; }
+as_playground() {
+  runuser -u playground -- env PLAYGROUND_KAI_HOME="$kai_home" PLAYGROUND_BWRAP="$app/bin/bwrap" "$@"
+}
 as_playground "$app/sandbox/bwrap.sh" "$job" warm kai build main.kai -o prog
 started=$(date +%s)
 as_playground "$app/sandbox/bwrap.sh" "$job" build kai build main.kai -o prog
@@ -89,6 +109,11 @@ systemctl enable -q kaikai-playground
 systemctl restart kaikai-playground
 sleep 1
 curl -fsS http://127.0.0.1:8090/api/version; echo
+# The same path a visitor takes, through the service's own limits.
+curl -fsS -X POST http://127.0.0.1:8090/api/compile \
+  -d '{"body":"fn main() {\n  println(\"service ok\")\n}\n"}' | grep -q 'service ok' ||
+  { echo "the service cannot run a program; see journalctl -u kaikai-playground" >&2; exit 1; }
+echo "service ok"
 
 echo "==> nginx"
 install -m 644 "$src/deploy/nginx-zones.conf" /etc/nginx/conf.d/kaikai-playground.conf

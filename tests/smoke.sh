@@ -35,10 +35,11 @@ big=$(head -c 70000 /dev/zero | tr '\0' '#' | program)
 expect "rejects large sources" "$(post /api/compile "$big")"    413 'too large'
 
 # More simultaneous slow jobs than workers plus waiting room: some must
-# be turned away, and the rest must still finish.
+# be turned away, and the rest must still finish. Each job prints the
+# pid of this run, so a cached answer never stands in for a real one.
 i=0
 while [ $i -lt 16 ]; do
-  slow=$(printf 'import time\n\nfn main() : Unit / Console + Clock = {\n  sleep(seconds(2))\n  println("job %s")\n}\n' "$i" | program)
+  slow=$(printf 'import time\n\nfn main() : Unit / Console + Clock = {\n  sleep(seconds(2))\n  println("job %s")\n}\n' "$i-$$" | program)
   curl -s -o /dev/null -w '%{http_code}\n' -X POST "$base/api/compile" --data-binary "$slow" &
   i=$((i + 1))
 done > /tmp/pg-smoke.codes

@@ -58,5 +58,27 @@ Settings come from the environment:
 
 `sudo sh deploy/setup.sh` installs or updates everything on a Debian or
 Ubuntu host: bubblewrap, the toolchain, the service and the nginx location.
+With `UPGRADE_KAI=1` it first moves the toolchain to its latest release;
+the compiler cache is rebuilt on every run, so it always matches.
+
+## Isolation
+
+A submitted program can call any C function through `extern "C"`, so
+nothing here relies on the language to contain it:
+
+- **bubblewrap** gives it no network, a read-only `/usr`, a private
+  process tree and no way to create further user namespaces. The job
+  directory is writable while compiling and read-only while running.
+- **A cgroup per job** caps memory (256 MB to run, 1.5 GB to compile) and
+  the number of processes (64 and 128). `clean` kills whatever is left.
+- **The systemd unit** filters system calls for the service and all its
+  children (no `bpf`, `io_uring`, `ptrace`, `userfaultfd`, keyrings…),
+  drops every capability and mounts the system read-only.
+- **AppArmor** lets only the playground's own copy of bubblewrap create
+  user namespaces, and only the `playground` group can execute it.
+
+The kernel is still shared with the host. A kernel exploit that gets
+past the system call filter gets out; closing that takes gVisor or a
+microVM.
 Never expose a server running `none.sh`: a submitted program can call
 any C function through `extern "C"`.

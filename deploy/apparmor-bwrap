@@ -1,10 +1,12 @@
 # Ubuntu 24.04 denies user namespaces to unprivileged programs unless a
-# profile grants them. This one lets bubblewrap create its sandbox.
+# profile grants them. This one grants them to the playground's own copy
+# of bubblewrap, which only the playground group may execute; the
+# system's /usr/bin/bwrap stays restricted.
 abi <abi/4.0>,
 include <tunables/global>
 
-profile bwrap /usr/bin/bwrap flags=(unconfined) {
+profile kaikai-playground-bwrap /opt/kaikai-playground/bin/bwrap flags=(unconfined) {
   userns,
 
-  include if exists <local/bwrap>
+  include if exists <local/kaikai-playground-bwrap>
 }

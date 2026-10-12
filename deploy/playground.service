@@ -8,28 +8,60 @@ WorkingDirectory=/opt/kaikai-playground
 ExecStart=/opt/kaikai-playground/playground
 Environment=PLAYGROUND_PORT=8090
 Environment=PLAYGROUND_LAUNCHER=/opt/kaikai-playground/sandbox/bwrap.sh
+Environment=PLAYGROUND_BWRAP=/opt/kaikai-playground/bin/bwrap
 Environment=PLAYGROUND_KAI_HOME=/opt/kaikai
 Environment=PLAYGROUND_KAI=kai
 Environment=PLAYGROUND_WORKDIR=/tmp/kaikai-playground
+Environment=PLAYGROUND_CGROUPS=1
 Environment=PATH=/opt/kaikai/bin:/usr/bin:/bin
 ExecStartPre=/usr/bin/mkdir -p /tmp/kaikai-playground
 # A trap in the server ends the process; come back at once.
 Restart=always
 RestartSec=1
 
-# The budget every job shares. A program that eats memory is killed by
-# the kernel inside this cgroup instead of hurting the host, and the
-# server keeps running: without OOMPolicy=continue systemd would stop
-# the whole unit along with it.
+# The budget all jobs share. Each job gets a smaller one of its own: the
+# launcher makes a cgroup per job next to `main`, where the server runs,
+# which is why this cgroup is delegated to the service's user.
 MemoryMax=2G
-OOMPolicy=continue
 MemorySwapMax=0
 TasksMax=512
 CPUQuota=400%
+Delegate=memory pids
+DelegateSubgroup=main
+# The kernel kills the program that runs out of memory; without this
+# systemd would stop the whole unit along with it.
+OOMPolicy=continue
 
+# What follows also binds every submitted program, since they are all
+# children of this service.
 NoNewPrivileges=yes
-PrivateTmp=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# System calls no playground program has a use for, and that kernel
+# exploits are fond of.
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=~@clock @cpu-emulation @debug @module @obsolete @raw-io @reboot @swap @keyring
+SystemCallFilter=~bpf io_uring_setup io_uring_enter io_uring_register userfaultfd perf_event_open
+SystemCallFilter=~process_vm_readv process_vm_writev kexec_load kexec_file_load open_by_handle_at name_to_handle_at
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# The server needs /tmp, its own cgroup and nothing else in writing.
+# Options that mask parts of /proc are left out on purpose: bubblewrap
+# cannot mount a fresh /proc for the sandbox under them.
+ProtectSystem=strict
 ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+InaccessiblePaths=-/var/www -/var/log -/var/lib -/var/backups -/var/mail -/srv -/root -/boot
+InaccessiblePaths=-/etc/nginx -/etc/letsencrypt -/etc/ssh -/etc/ssl/private
 
 [Install]
 WantedBy=multi-user.target
