@@ -4,8 +4,6 @@ each owned by one actor: the gate that bounds how many jobs run at
 once, and the cache of finished responses.
 """)]
 
-import actor
-
 import collections.map as cmap
 
 #[doc("What a connection fiber hears back from the gate or the cache.")]
