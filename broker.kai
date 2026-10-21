@@ -28,7 +28,7 @@ fn gate_loop(free: Int, waiting: [Pid[Reply]], max_waiting: Int) : Unit / Actor[
       if free > 0 {
         Actor.send(who, Granted)
         gate_loop(free - 1, waiting, max_waiting)
-      } else if waiting.length() >= max_waiting {
+      } else if (waiting |> length()) >= max_waiting {
         Actor.send(who, Busy)
         gate_loop(free, waiting, max_waiting)
       } else {
