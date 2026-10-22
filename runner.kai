@@ -157,16 +157,18 @@ fn build_failed(o: Outcome, dir: String) : Option[JobResult] = match o.stop {
 }
 
 # A sandbox reports a program killed inside it as exit status 128 + 9,
-# since the launcher itself was not the one signalled.
+# since the launcher itself was not the one signalled. What a program
+# prints is never cached: fibers, the clock and randomness can change it
+# from one run to the next.
 fn ran(o: Outcome) : JobResult = match o.stop {
   Finished(137) ->
     JobResult { errors: "", output: o.out, status: 137, reason: "killed", cacheable: false }
   Finished(code) ->
-    JobResult { errors: "", output: o.out, status: code, reason: "", cacheable: true }
+    JobResult { errors: "", output: o.out, status: code, reason: "", cacheable: false }
   TimedOut ->
     JobResult { errors: "", output: o.out, status: -1, reason: "timeout", cacheable: false }
   TooMuchOutput ->
-    JobResult { errors: "", output: o.out, status: -1, reason: "output_limit", cacheable: true }
+    JobResult { errors: "", output: o.out, status: -1, reason: "output_limit", cacheable: false }
   Killed(sig) ->
     JobResult { errors: "", output: o.out, status: 128 + sig, reason: "killed", cacheable: false }
   Failed(e) -> internal(e)

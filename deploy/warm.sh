@@ -55,6 +55,9 @@ build_time() {
 }
 
 if [ "${1:-}" = check ]; then
+  # The compiler takes an entry over an hour old as missing unless it can
+  # touch it, and builds cannot; keeping every entry young avoids that.
+  find "$app/cache" -exec touch -h {} +
   took=$(build_time "$app/cache")
   [ "$took" -ge "$slow" ] || exit 0
   echo "build against the cache took ${took}s; building a new one"

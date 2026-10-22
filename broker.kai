@@ -44,8 +44,9 @@ fn gate_loop(free: Int, waiting: [Pid[Reply]], max_waiting: Int) : Unit / Actor[
   }
 
 #[doc("""
-Response cache keyed by the hash of the submitted source. It holds at
-most `capacity` entries and starts over when it fills up.
+Response cache keyed by the hash of the submitted source, for builds
+that failed. It holds at most `capacity` entries and starts over when
+it fills up.
 """)]
 pub fn cache(capacity: Int) : Unit / Actor[CacheMsg] = cache_loop(cmap.empty(), capacity)
 
