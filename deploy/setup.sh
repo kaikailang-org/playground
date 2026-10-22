@@ -72,40 +72,16 @@ rm -rf "$scratch"
 
 echo "==> compiler cache and sandbox check"
 # Rebuilt from scratch so it always matches the installed toolchain.
-rm -rf "$app/cache"
-mkdir -p "$app/cache"
-chown playground "$app/cache"
-job=$(mktemp -d /tmp/job-XXXXXX)
-chown playground "$job"
-# Importing the modules a playground program is likely to use puts them
-# in the cache too.
-cat > "$job/main.kai" <<'KAI'
-import time
-import loop
-import spawn
-import actor
-import collections.map as cmap
-import encoding.json
-
-fn main() {
-  println("sandbox ok")
-}
-KAI
-chown playground "$job/main.kai"
-as_playground() {
-  runuser -u playground -- env PLAYGROUND_KAI_HOME="$kai_home" PLAYGROUND_BWRAP="$app/bin/bwrap" "$@"
-}
-as_playground "$app/sandbox/bwrap.sh" "$job" warm kai build main.kai -o prog
-started=$(date +%s)
-as_playground "$app/sandbox/bwrap.sh" "$job" build kai build main.kai -o prog
-echo "warm build: $(( $(date +%s) - started ))s"
-as_playground "$app/sandbox/bwrap.sh" "$job" run ./prog
-rm -rf "$job"
+install -m 755 "$src/deploy/warm.sh" "$app/sandbox/warm.sh"
+sh "$app/sandbox/warm.sh"
 
 echo "==> systemd"
 install -m 644 "$src/deploy/playground.service" /etc/systemd/system/kaikai-playground.service
+install -m 644 "$src/deploy/playground-warm.service" /etc/systemd/system/kaikai-playground-warm.service
+install -m 644 "$src/deploy/playground-warm.timer" /etc/systemd/system/kaikai-playground-warm.timer
 systemctl daemon-reload
 systemctl enable -q kaikai-playground
+systemctl enable -q --now kaikai-playground-warm.timer
 systemctl restart kaikai-playground
 sleep 1
 curl -fsS http://127.0.0.1:8090/api/version; echo

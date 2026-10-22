@@ -1,0 +1,6 @@
+[Unit]
+Description=refill the kaikai playground compiler cache when builds run cold
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /opt/kaikai-playground/sandbox/warm.sh check

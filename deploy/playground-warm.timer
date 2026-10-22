@@ -1,0 +1,9 @@
+[Unit]
+Description=check the kaikai playground compiler cache
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
