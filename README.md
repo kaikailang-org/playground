@@ -44,6 +44,10 @@ make run            # listens on 127.0.0.1:8090, no isolation
 make smoke          # in another shell
 ```
 
+`make test` runs the unit tests (`*_test.kai`); they need `kai` on `PATH`.
+
+The server creates its work directory, parents included, when it starts.
+
 Settings come from the environment:
 
 | Variable | Default |

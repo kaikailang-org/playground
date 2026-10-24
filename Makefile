@@ -1,4 +1,4 @@
-.PHONY: build run smoke
+.PHONY: build run smoke test
 
 build:
 	mkdir -p build
@@ -6,6 +6,10 @@ build:
 
 run: build
 	./build/playground
+
+test:
+	mkdir -p build
+	kai test .
 
 # Needs a server already running on the default port.
 smoke:

@@ -1,0 +1,40 @@
+# Tests for the parts of the runner that need no child process. Builds
+# and runs are covered through the server, in main_test.kai and
+# tests/smoke.sh.
+
+import uuid
+
+import playground.runner
+
+fn scratch() : String / Env + Random {
+  let tmp = match Env.get("TMPDIR") {
+    Some(d) -> if string_length(d) == 0 { "/tmp" } else { d }
+    None -> "/tmp"
+  }
+  "#{tmp}/playground-test-#{uuid.v4()}"
+}
+
+test "make_dirs — creates the missing parents" {
+  let root = scratch()
+  assert make_dirs("#{root}/a/b") == Ok(())
+  assert file_exists("#{root}/a/b")
+  assert make_dirs("#{root}/a/b") == Ok(())
+  assert dir_remove_dir("#{root}/a/b") == Ok(())
+  assert dir_remove_dir("#{root}/a") == Ok(())
+  assert dir_remove_dir(root) == Ok(())
+}
+
+test "make_dirs — a relative path stops at the working directory" {
+  let name = "build/playground-test-#{uuid.v4()}"
+  assert make_dirs("#{name}/a") == Ok(())
+  assert file_exists("#{name}/a")
+  assert dir_remove_dir("#{name}/a") == Ok(())
+  assert dir_remove_dir(name) == Ok(())
+}
+
+test "make_dirs — fails under a file" {
+  let file = scratch()
+  assert File.write_file(file, "") == Ok(())
+  assert make_dirs("#{file}/a") != Ok(())
+  assert file_delete(file) == Ok(())
+}

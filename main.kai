@@ -263,23 +263,29 @@ fn main() : Int / Stdout + Env + NetTcp + Spawn + Process + Clock + File + Rando
     max_output: int_setting("PLAYGROUND_MAX_OUTPUT", 65536)
   }
   let port = int_setting("PLAYGROUND_PORT", 8090)
-  match NetTcp.listen("127.0.0.1", port) {
+  match make_dirs(tools.workdir) {
     Err(e) -> {
-      Stdout.print("listen 127.0.0.1:#{port}: #{e}")
+      Stdout.print("workdir #{tools.workdir}: #{e}")
       1
     }
-    Ok(l) -> nursery { n ->
-      let version = toolchain_version(tools)
-      let server = Server {
-        tools: tools,
-        limits: limits,
-        version: version,
-        gate: spawn_actor(() => gate(WORKERS, MAX_WAITING)),
-        cache: spawn_actor(() => cache(CACHE_ENTRIES))
+    Ok(_) -> match NetTcp.listen("127.0.0.1", port) {
+      Err(e) -> {
+        Stdout.print("listen 127.0.0.1:#{port}: #{e}")
+        1
       }
-      Stdout.print("playground on 127.0.0.1:#{port}, #{version}")
-      with_mailbox(() => accept_loop(server, l, 0))
-      0
+      Ok(l) -> nursery { n ->
+        let version = toolchain_version(tools)
+        let server = Server {
+          tools: tools,
+          limits: limits,
+          version: version,
+          gate: spawn_actor(() => gate(WORKERS, MAX_WAITING)),
+          cache: spawn_actor(() => cache(CACHE_ENTRIES))
+        }
+        Stdout.print("playground on 127.0.0.1:#{port}, #{version}")
+        with_mailbox(() => accept_loop(server, l, 0))
+        0
+      }
     }
   }
 }
