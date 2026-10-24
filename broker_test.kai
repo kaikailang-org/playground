@@ -1,0 +1,59 @@
+# Tests for the gate and the cache, each spawned as the real actor and
+# driven from the test's own mailbox.
+
+import actor
+
+import time
+
+import playground.broker
+
+# The replies waiting in this fiber's mailbox, in order, until none
+# arrives within a tenth of a second.
+fn replies(seen: [Reply]) : [Reply] / Actor[Reply] = match receive_timeout(millis(100)) {
+  None -> seen
+  Some(r) -> replies(seen ++ [r])
+}
+
+fn acquire(g: Pid[GateMsg]) : [Reply] / Actor[Reply] {
+  Actor.send(g, Acquire(Actor.self()))
+  replies([])
+}
+
+fn release(g: Pid[GateMsg]) : [Reply] / Actor[Reply] {
+  Actor.send(g, Release)
+  replies([])
+}
+
+test "gate — grants its slots, queues the line and turns the rest away" {
+  let got = with_mailbox(() => {
+    let g = spawn_actor(() => gate(1, 1))
+    [acquire(g), acquire(g), acquire(g), release(g), release(g), acquire(g)]
+  })
+  assert got == [[Granted], [], [Busy], [Granted], [], [Granted]]
+}
+
+test "gate — every slot is granted at once" {
+  let got = with_mailbox(() => {
+    let g = spawn_actor(() => gate(2, 0))
+    [acquire(g), acquire(g), acquire(g)]
+  })
+  assert got == [[Granted], [Granted], [Busy]]
+}
+
+fn lookup(c: Pid[CacheMsg], key: String) : Reply / Actor[Reply] {
+  Actor.send(c, Lookup(key, Actor.self()))
+  Actor.receive()
+}
+
+test "cache — remembers up to its capacity, then starts over" {
+  let got = with_mailbox(() => {
+    let c = spawn_actor(() => cache(2))
+    let before = lookup(c, "a")
+    Actor.send(c, Store("a", "A"))
+    Actor.send(c, Store("b", "B"))
+    let full = [lookup(c, "a"), lookup(c, "b")]
+    Actor.send(c, Store("c", "C"))
+    [before, ...full] ++ [lookup(c, "a"), lookup(c, "b"), lookup(c, "c")]
+  })
+  assert got == [Miss, Hit("A"), Hit("B"), Miss, Miss, Hit("C")]
+}

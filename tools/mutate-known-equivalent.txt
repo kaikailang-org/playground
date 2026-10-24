@@ -1,0 +1,4 @@
+# Mutants that mean exactly what the original means, and so can never
+# be killed. Keyed <file>:<line>:<operator>; the reason is mandatory.
+
+main.kai:223:literal  # drain_done: `receive_timeout(0)` -> `receive_timeout(1)` is a deadline of one nanosecond instead of none. Either call returns a message already in the mailbox and None otherwise; the only difference is a timer no one can observe.

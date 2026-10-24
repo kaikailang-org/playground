@@ -1,0 +1,410 @@
+# Tests for the server's own logic: request parsing, the JSON it
+# answers with, routing, the gate and cache it is built with, the
+# connection plumbing and startup.
+#
+# The connection and startup tests replace `NetTcp`, `Stdout` and `Env`
+# with handlers, so they run without a client or a free port. The
+# routes that compile or format call the real toolchain through
+# `sandbox/none.sh`, so `kai` must be on PATH.
+#
+# The connection limit lives in the accept loop, which never returns;
+# tests/smoke.sh covers it against a running server.
+
+import actor
+
+import time
+
+import uuid
+
+import net.tcp
+
+import net.http
+
+import encoding.json
+
+import encoding.json_bind
+
+import playground.broker
+
+import playground.runner
+
+import playground.main
+
+# ---- helpers -------------------------------------------------------
+
+fn has(text: String, needle: String) : Bool = match index_of(text, needle) {
+  Some(_) -> true
+  None -> false
+}
+
+fn request(method: String, url: String, body: String) : http.Request = http.Request {
+  method: method,
+  url: url,
+  headers: [],
+  body: body
+}
+
+fn source_request(src: String) : http.Request =
+  request("POST", "/api/compile", json_encode(JObj([("body", JStr(src))])))
+
+fn scratch() : String / Env + Random {
+  let tmp = match Env.get("TMPDIR") {
+    Some(d) -> if string_length(d) == 0 { "/tmp" } else { d }
+    None -> "/tmp"
+  }
+  "#{tmp}/playground-test-#{uuid.v4()}"
+}
+
+fn test_tools(workdir: String) : Tools = Tools {
+  launcher: "sandbox/none.sh",
+  kai: "kai",
+  workdir: workdir
+}
+
+fn test_limits() : Limits = Limits { build_secs: 30, run_secs: 5, max_output: 65536 }
+
+fn status_of(r: Result[String, http.Response]) : Int = match r {
+  Ok(_) -> 200
+  Err(resp) -> resp.status
+}
+
+fn answer(r: http.Response) : String = "#{r.status} #{r.body}"
+
+# The replies waiting in this fiber's mailbox, in order, until none
+# arrives within a tenth of a second.
+fn replies(seen: [Reply]) : [Reply] / Actor[Reply] = match receive_timeout(millis(100)) {
+  None -> seen
+  Some(r) -> replies(seen ++ [r])
+}
+
+fn acquire(s: Server, times: Int) : Unit / Actor[Reply] =
+  if times == 0 {
+    ()
+  } else {
+    Actor.send(s.gate, Acquire(Actor.self()))
+    acquire(s, times - 1)
+  }
+
+fn store(s: Server, from: Int, to: Int) : Unit / Actor[Reply] =
+  if from >= to {
+    ()
+  } else {
+    Actor.send(s.cache, Store("key #{from}", "body #{from}"))
+    store(s, from + 1, to)
+  }
+
+fn lookup(s: Server, key: String) : Reply / Actor[Reply] {
+  Actor.send(s.cache, Lookup(key, Actor.self()))
+  Actor.receive()
+}
+
+# ---- request parsing and responses ---------------------------------
+
+test "source_of — takes the body string out of the JSON" {
+  assert source_of(source_request("fn main() : Int = 0")) == Ok("fn main() : Int = 0")
+  assert status_of(source_of(request("POST", "/api/compile", "nope"))) == 400
+  assert status_of(source_of(request("POST", "/api/compile", "{\"source\":\"x\"}"))) == 400
+  assert status_of(source_of(request("POST", "/api/compile", "{\"body\":3}"))) == 400
+}
+
+test "source_of — the size limit is inclusive" {
+  let largest = repeat("#", 65536)
+  assert source_of(source_request(largest)) == Ok(largest)
+  assert status_of(source_of(source_request(largest ++ "#"))) == 413
+}
+
+test "job_json — what the program printed is one stdout event" {
+  let printed = JobResult { errors: "", output: "x", status: 0, reason: "", cacheable: false }
+  assert job_json(printed)
+    == "{\"errors\":\"\",\"events\":[{\"kind\":\"stdout\",\"message\":\"x\",\"delay\":0}],\"status\":0,\"reason\":\"\"}"
+  let silent = JobResult { errors: "e", output: "", status: 3, reason: "timeout", cacheable: false }
+  assert job_json(silent) == "{\"errors\":\"e\",\"events\":[],\"status\":3,\"reason\":\"timeout\"}"
+}
+
+test "cache_key — the SHA-256 of the source, in hex" {
+  assert cache_key("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  assert cache_key("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+}
+
+# ---- routing -------------------------------------------------------
+
+test "route — the calls that need no job" {
+  let got = with_mailbox(
+    () => with_server(
+      test_tools("/nonexistent"),
+      test_limits(),
+      "kaikai test",
+      s => [
+        answer(route(s, request("GET", "/api/version", ""))),
+        answer(route(s, request("GET", "/healthz", ""))),
+        answer(route(s, request("GET", "/api/compile", ""))),
+        answer(route(s, request("PUT", "/api/fmt", ""))),
+        answer(route(s, request("GET", "/nope", ""))),
+        answer(route(s, request("POST", "/api/version", ""))),
+        answer(route(s, request("POST", "/api/compile", "{}")))
+      ]
+    )
+  )
+  assert got
+    == [
+      "200 {\"version\":\"kaikai test\"}",
+      "200 {\"ok\":true}",
+      "405 {\"error\":\"use POST\"}",
+      "405 {\"error\":\"use POST\"}",
+      "404 {\"error\":\"not found\"}",
+      "404 {\"error\":\"not found\"}",
+      "400 {\"error\":\"the request has no \\\"body\\\" string\"}"
+    ]
+}
+
+test "route — a cached answer is served without a job" {
+  let src = "fn main() : Int = 0"
+  let got = with_mailbox(
+    () => with_server(test_tools("/nonexistent"), test_limits(), "v", s => {
+      Actor.send(s.cache, Store(cache_key(src), "{\"cached\":true}"))
+      answer(route(s, source_request(src)))
+    })
+  )
+  assert got == "200 {\"cached\":true}"
+}
+
+test "route — a failed build is answered and remembered" {
+  let dir = scratch()
+  assert make_dirs(dir) == Ok(())
+  let src = "fn main() : Unit / Console = {\n  println(nope)\n}\n"
+  let (got, remembered) = with_mailbox(
+    () => with_server(test_tools(dir), test_limits(), "v", s => {
+      let r = route(s, source_request(src))
+      (r, lookup(s, cache_key(src)))
+    })
+  )
+  assert got.status == 200
+  assert has(got.body, "main.kai:2:11")
+  assert remembered == Hit(got.body)
+  assert dir_remove_dir(dir) == Ok(())
+}
+
+test "route — a formatter error is still a 200" {
+  let dir = scratch()
+  assert make_dirs(dir) == Ok(())
+  let got = with_mailbox(
+    () => with_server(test_tools(dir), test_limits(), "v", s => {
+      route(s, request("POST", "/api/fmt", json_encode(JObj([("body", JStr("fn main( {"))]))))
+    })
+  )
+  assert got.status == 200
+  assert has(got.body, "\"body\":\"\"")
+  assert not has(got.body, "\"error\":\"\"")
+  assert dir_remove_dir(dir) == Ok(())
+}
+
+# ---- the server's gate and cache -----------------------------------
+
+test "with_server — four jobs run, eight wait, the rest are turned away" {
+  let (first, more) = with_mailbox(
+    () => with_server(test_tools("/nonexistent"), test_limits(), "v", s => {
+      acquire(s, 12)
+      let first = replies([])
+      acquire(s, 1)
+      (first, replies([]))
+    })
+  )
+  assert first == [Granted, Granted, Granted, Granted]
+  assert more == [Busy]
+}
+
+test "with_server — the cache holds 256 answers" {
+  let (full, over) = with_mailbox(
+    () => with_server(test_tools("/nonexistent"), test_limits(), "v", s => {
+      store(s, 0, 256)
+      let full = [lookup(s, "key 0"), lookup(s, "key 255")]
+      store(s, 256, 257)
+      (full, [lookup(s, "key 0"), lookup(s, "key 256")])
+    })
+  )
+  assert full == [Hit("body 0"), Hit("body 255")]
+  assert over == [Miss, Hit("body 256")]
+}
+
+# ---- connections ---------------------------------------------------
+
+# A client socket of our own, so the handlers below have a real `Conn`
+# to be handed; no byte goes through it.
+fn loopback() : Conn / NetTcp = match NetTcp.listen("127.0.0.1", 0) {
+  Err(e) -> panic("listen: #{e}")
+  Ok(l) -> match NetTcp.connect("127.0.0.1", l.port) {
+    Err(e) -> panic("connect: #{e}")
+    Ok(c) -> c
+  }
+}
+
+type Wire = { sent: [Int], sends: Int, closed: Bool, script: [[Int]] }
+
+fn wire(script: [[Int]]) : Wire = Wire { sent: [], sends: 0, closed: false, script: script }
+
+# Runs `body` against a peer that takes at most `chunk` bytes per send,
+# except that the first `stalls` sends take none, and that answers
+# recvs from `script`, then with end of stream.
+fn on_wire(
+  chunk: Int,
+  stalls: Int,
+  script: [[Int]],
+  body: () -> Unit / NetTcp + e
+) : Wire / e = handle {
+  body()
+} with NetTcp(wire(script)) {
+  connect(host, port, resume) -> panic("connect is not scripted")
+  listen(host, port, resume) -> panic("listen is not scripted")
+  accept(l, resume) -> panic("accept is not scripted")
+  send(c, data, resume) -> {
+    let n = if state.sends < stalls { 0 } else { min(chunk, list.length(data)) }
+    resume(Ok(n), Wire { ...state, sent: state.sent ++ list.take(data, n), sends: state.sends + 1 })
+  }
+  recv(c, max, resume) -> match state.script {
+    [] -> resume(Ok([]), state)
+    [next, ...rest] -> resume(Ok(next), Wire { ...state, script: rest })
+  }
+  recv_timeout(c, max, nanos, resume) -> panic("recv_timeout is not scripted")
+  close(c, resume) -> resume((), Wire { ...state, closed: true })
+  return(_u) -> state
+}
+
+test "send_all — keeps sending until everything is out" {
+  let c = loopback()
+  let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  let thirds = on_wire(3, 0, [], () => send_all(c, data))
+  assert thirds.sent == data
+  assert thirds.sends == 4
+  let bytewise = on_wire(1, 0, [], () => send_all(c, data))
+  assert bytewise.sent == data
+  assert bytewise.sends == 10
+  let nothing = on_wire(3, 0, [], () => send_all(c, []))
+  assert nothing.sends == 0
+}
+
+test "send_all — gives up on a peer that takes nothing" {
+  let c = loopback()
+  let stalled = on_wire(10, 1, [], () => send_all(c, [1, 2, 3]))
+  assert stalled.sent == []
+  assert stalled.sends == 1
+}
+
+# Stdout lines the body printed, beside its result.
+fn printed(body: () -> a / Stdout + e) : Pair[a, [String]] / e = handle {
+  body()
+} with Stdout([]) {
+  print(s, resume) -> resume((), state ++ [s])
+  is_tty(resume) -> resume(false, state)
+  return(x) -> (x, state)
+}
+
+fn serve_script(
+  script: [[Int]]
+) : Pair[Wire, [String]] / NetTcp + File + Random + Process + Spawn + Clock = with_mailbox(() => {
+  with_server(test_tools("/nonexistent"), test_limits(), "v", s => {
+    let c = loopback()
+    printed(() => on_wire(65536, 0, script, () => serve_conn(s, c)))
+  })
+})
+
+test "serve_conn — answers, logs and closes" {
+  let (w, log) = serve_script([http.string_to_bytes("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")])
+  let reply = http.bytes_to_string(w.sent)
+  assert starts_with(reply, "HTTP/1.1 200")
+  assert has(reply, "{\"ok\":true}")
+  assert w.closed
+  assert log == ["GET /healthz 200"]
+}
+
+test "serve_conn — a request it cannot read is a 400" {
+  let (w, log) = serve_script([http.string_to_bytes("nonsense")])
+  let reply = http.bytes_to_string(w.sent)
+  assert starts_with(reply, "HTTP/1.1 400")
+  assert has(reply, "bad request")
+  assert w.closed
+  assert log == []
+}
+
+# A mailbox that answers each non-blocking receive from `script`.
+fn drained(live: Int, script: [Option[ConnMsg]]) : Int = handle {
+  drain_done(live)
+} with Actor[ConnMsg](script) {
+  receive_timeout(ns, resume) -> match state {
+    [] -> resume(None, [])
+    [next, ...rest] -> resume(next, rest)
+  }
+  receive(resume) -> panic("receive is not scripted")
+  send(pid, msg, resume) -> resume((), state)
+  self(resume) -> panic("a scripted mailbox has no Pid")
+  return(x) -> x
+}
+
+test "drain_done — counts every connection that finished" {
+  assert drained(5, [None]) == 5
+  assert drained(5, [Some(ConnDone), Some(ConnDone), None]) == 3
+  assert drained(5, [Some(ConnDone), None, Some(ConnDone)]) == 4
+}
+
+# ---- startup -------------------------------------------------------
+
+fn lookup_env(env: [Pair[String, String]], name: String) : Option[String] = match env {
+  [] -> None
+  [(k, v), ...rest] -> if k == name { Some(v) } else { lookup_env(rest, name) }
+}
+
+# Runs `main` with `env` for its environment and a port that is always
+# taken.
+fn start(
+  env: [Pair[String, String]]
+) : Pair[Int, [String]] / File + Random + Process + Spawn + Clock = printed(() => {
+  handle {
+    handle {
+      main.main()
+    } with NetTcp {
+      connect(host, port, resume) -> panic("connect is not scripted")
+      listen(host, port, resume) -> resume(Err("address in use"))
+      accept(l, resume) -> panic("accept is not scripted")
+      send(c, data, resume) -> panic("send is not scripted")
+      recv(c, max, resume) -> panic("recv is not scripted")
+      recv_timeout(c, max, nanos, resume) -> panic("recv_timeout is not scripted")
+      close(c, resume) -> resume(())
+    }
+  } with Env {
+    args(resume) -> resume([])
+    get(name, resume) -> resume(lookup_env(env, name))
+    set_var(name, value, resume) -> resume(Ok(()))
+    unset_var(name, resume) -> resume(Ok(()))
+    vars(resume) -> resume(env)
+  }
+})
+
+test "main — reports a port it cannot listen on" {
+  let dir = scratch()
+  assert start([("PLAYGROUND_WORKDIR", dir)]) == ((1, ["listen 127.0.0.1:8090: address in use"]))
+  assert start([("PLAYGROUND_WORKDIR", dir), ("PLAYGROUND_PORT", "7")])
+    == ((1, ["listen 127.0.0.1:7: address in use"]))
+  assert start([("PLAYGROUND_WORKDIR", dir), ("PLAYGROUND_PORT", "")])
+    == ((1, ["listen 127.0.0.1:8090: address in use"]))
+  assert dir_remove_dir(dir) == Ok(())
+}
+
+test "main — creates the work directory, parents included" {
+  let root = scratch()
+  let dir = "#{root}/a/b"
+  assert not file_exists(root)
+  let (code, _) = start([("PLAYGROUND_WORKDIR", dir)])
+  assert code == 1
+  assert dir_remove_dir(dir) == Ok(())
+  assert dir_remove_dir("#{root}/a") == Ok(())
+  assert dir_remove_dir(root) == Ok(())
+}
+
+test "main — stops when the work directory cannot be made" {
+  let dir = scratch()
+  assert File.write_file(dir, "not a directory") == Ok(())
+  let (code, log) = start([("PLAYGROUND_WORKDIR", "#{dir}/jobs")])
+  assert code == 1
+  assert list.length(log) == 1
+  assert starts_with(log |> list.head() |> unwrap_or(""), "workdir #{dir}/jobs: ")
+  assert file_delete(dir) == Ok(())
+}
