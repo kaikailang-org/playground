@@ -44,7 +44,9 @@ make run            # listens on 127.0.0.1:8090, no isolation
 make smoke          # in another shell
 ```
 
-`make test` runs the unit tests (`*_test.kai`); they need `kai` on `PATH`.
+`make test` runs the unit tests (`*_test.kai`); `make check` runs them,
+then starts a server of its own on `CHECK_PORT` (8291 by default) and
+runs the smoke suite against it. Both need `kai` on `PATH`.
 
 The server creates its work directory, parents included, when it starts.
 

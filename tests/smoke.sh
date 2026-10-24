@@ -3,15 +3,17 @@
 set -u
 base=${1:-http://127.0.0.1:8090}
 fails=0
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/pg-smoke.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
 
-post() { curl -s -o /tmp/pg-smoke.out -w '%{http_code}' -X POST "$base$1" --data-binary "$2"; }
+post() { curl -s -o "$tmp/out" -w '%{http_code}' -X POST "$base$1" --data-binary "$2"; }
 
 expect() {
   name=$1 code=$2 want_code=$3 want_text=$4
-  if [ "$code" = "$want_code" ] && grep -q -- "$want_text" /tmp/pg-smoke.out; then
+  if [ "$code" = "$want_code" ] && grep -q -- "$want_text" "$tmp/out"; then
     echo "ok   $name"
   else
-    echo "FAIL $name: status $code, body $(head -c 300 /tmp/pg-smoke.out)"
+    echo "FAIL $name: status $code, body $(head -c 300 "$tmp/out")"
     fails=$((fails + 1))
   fi
 }
@@ -42,14 +44,49 @@ while [ $i -lt 16 ]; do
   slow=$(printf 'import time\n\nfn main() : Unit / Console + Clock = {\n  sleep(seconds(2))\n  println("job %s")\n}\n' "$i-$$" | program)
   curl -s -o /dev/null -w '%{http_code}\n' -X POST "$base/api/compile" --data-binary "$slow" &
   i=$((i + 1))
-done > /tmp/pg-smoke.codes
+done > "$tmp/codes"
 wait
-served=$(grep -c 200 /tmp/pg-smoke.codes)
-turned=$(grep -c 503 /tmp/pg-smoke.codes)
+served=$(grep -c 200 "$tmp/codes")
+turned=$(grep -c 503 "$tmp/codes")
 if [ "$served" -ge 4 ] && [ "$turned" -ge 1 ] && [ $((served + turned)) -eq 16 ]; then
   echo "ok   sheds load ($served served, $turned turned away)"
 else
   echo "FAIL sheds load: $served served, $turned turned away"
+  fails=$((fails + 1))
+fi
+
+# Past 64 open connections a new one is closed unanswered, and the
+# server takes connections again once those close.
+hostport=${base#*://}
+hostport=${hostport%%/*}
+limit=$(perl -MIO::Socket::INET -e '
+  my ($host, $port) = @ARGV;
+  sub conn { IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port) or die "connect: $!\n" }
+  sub ask {
+    my $c = conn();
+    print $c "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+    my $got = eval {
+      local $SIG{ALRM} = sub { die "hung\n" };
+      alarm 5;
+      local $/;
+      my $r = <$c>;
+      alarm 0;
+      defined $r ? $r : "";
+    };
+    return "hung" unless defined $got;
+    return $got =~ m{^HTTP/1\.1 200} ? "served" : $got eq "" ? "closed" : "other";
+  }
+  my @idle = map { conn() } 1 .. 64;
+  select(undef, undef, undef, 0.5);
+  my $over = ask();
+  close $_ for @idle;
+  select(undef, undef, undef, 0.5);
+  print "$over ", ask(), "\n";
+' "${hostport%:*}" "${hostport##*:}" 2>&1)
+if [ "$limit" = "closed served" ]; then
+  echo "ok   limits connections"
+else
+  echo "FAIL limits connections: $limit"
   fails=$((fails + 1))
 fi
 
