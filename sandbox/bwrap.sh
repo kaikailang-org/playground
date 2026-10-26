@@ -88,6 +88,7 @@ toolchain() {
   shift
   isolate --ro-bind "$kai_home" "$kai_home" \
     "$cache_bind" "$cache" /cache --setenv XDG_CACHE_HOME /cache \
+    ${slots:+--size 65536 --tmpfs /cache/kai/jobs} \
     --bind "$dir" /job --chdir /job -- "$@"
 }
 
@@ -98,6 +99,9 @@ case "$mode" in
   build)
     confine $BUILD_MEMORY $BUILD_TASKS
     ulimit -t 30
+    # The compiler takes a compile slot by locking a file in the cache and
+    # waits until it can, so a build gets slot files of its own.
+    slots=1
     toolchain --ro-bind-try "$@" ;;
   warm)
     toolchain --bind "$@" ;;

@@ -58,6 +58,7 @@ if [ "${1:-}" = check ]; then
   # The compiler takes an entry over an hour old as missing unless it can
   # touch it, and builds cannot; keeping every entry young avoids that.
   find "$app/cache" -exec touch -h {} +
+  mkdir -p "$app/cache/kai/jobs"
   took=$(build_time "$app/cache")
   [ "$took" -ge "$slow" ] || exit 0
   echo "build against the cache took ${took}s; building a new one"
@@ -67,6 +68,8 @@ rm -rf "$fresh"
 mkdir -m 755 "$fresh"
 chown playground "$fresh"
 with_cache "$fresh" warm kai build main.kai -o prog >/dev/null 2>&1
+# Where builds mount the files they lock to take a compile slot.
+mkdir -p "$fresh/kai/jobs"
 took=$(build_time "$fresh")
 echo "build against the new cache: ${took}s"
 [ "$took" -lt "$slow" ] || { echo "the new cache does not help; keeping the old one" >&2; exit 1; }
