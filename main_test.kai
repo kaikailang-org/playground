@@ -30,6 +30,8 @@ import playground.runner
 
 import playground.main
 
+import fs.file
+
 # ---- helpers -------------------------------------------------------
 
 fn has(text: String, needle: String) : Bool = match index_of(text, needle) {
@@ -47,7 +49,7 @@ fn request(method: String, url: String, body: String) : http.Request = http.Requ
 fn source_request(src: String) : http.Request =
   request("POST", "/api/compile", json_encode(JObj([("body", JStr(src))])))
 
-fn scratch() : String / Env + Random {
+fn scratch() : String / Env + SecureRandom {
   let tmp = match Env.get("TMPDIR") {
     Some(d) -> if string_length(d) == 0 { "/tmp" } else { d }
     None -> "/tmp"
@@ -265,6 +267,12 @@ fn on_wire(
     [next, ...rest] -> resume(Ok(next), Wire { ...state, script: rest })
   }
   recv_timeout(c, max, nanos, resume) -> panic("recv_timeout is not scripted")
+  recv_bytes(c, max, resume) -> match state.script {
+    [] -> resume(Ok(string.to_byte_array("")), state)
+    [next, ...rest] -> resume(Ok(string.to_byte_array(http.bytes_to_string(next))), Wire { ...state, script: rest })
+  }
+  recv_bytes_timeout(c, max, nanos, resume) -> panic("recv_bytes_timeout is not scripted")
+  send_bytes(c, data, resume) -> panic("send_bytes is not scripted")
   close(c, resume) -> resume((), Wire { ...state, closed: true })
   return(_u) -> state
 }
@@ -300,7 +308,7 @@ fn printed(body: () -> a / Stdout + e) : Pair[a, [String]] / e = handle {
 
 fn serve_script(
   script: [[Int]]
-) : Pair[Wire, [String]] / NetTcp + File + Random + Process + Spawn + Clock = with_mailbox(() => {
+) : Pair[Wire, [String]] / NetTcp + File + SecureRandom + Process + Spawn + Clock = with_mailbox(() => {
   with_server(test_tools("/nonexistent"), test_limits(), "v", s => {
     let c = loopback()
     printed(() => on_wire(65536, 0, script, () => serve_conn(s, c)))
@@ -356,7 +364,7 @@ fn lookup_env(env: [Pair[String, String]], name: String) : Option[String] = matc
 # taken.
 fn start(
   env: [Pair[String, String]]
-) : Pair[Int, [String]] / File + Random + Process + Spawn + Clock = printed(() => {
+) : Pair[Int, [String]] / File + SecureRandom + Process + Spawn + Clock = printed(() => {
   handle {
     handle {
       main.main()
@@ -367,6 +375,9 @@ fn start(
       send(c, data, resume) -> panic("send is not scripted")
       recv(c, max, resume) -> panic("recv is not scripted")
       recv_timeout(c, max, nanos, resume) -> panic("recv_timeout is not scripted")
+      recv_bytes(c, max, resume) -> panic("recv_bytes is not scripted")
+      recv_bytes_timeout(c, max, nanos, resume) -> panic("recv_bytes_timeout is not scripted")
+      send_bytes(c, data, resume) -> panic("send_bytes is not scripted")
       close(c, resume) -> resume(())
     }
   } with Env {
@@ -391,7 +402,7 @@ test "main — reports a port it cannot listen on" {
 test "main — creates the work directory, parents included" {
   let root = scratch()
   let dir = "#{root}/a/b"
-  assert not file_exists(root)
+  assert not file.exists(root)
   let (code, _) = start([("PLAYGROUND_WORKDIR", dir)])
   assert code == 1
   assert dir_remove_dir(dir) == Ok(())
@@ -406,5 +417,5 @@ test "main — stops when the work directory cannot be made" {
   assert code == 1
   assert list.length(log) == 1
   assert starts_with(log |> list.head() |> unwrap_or(""), "workdir #{dir}/jobs: ")
-  assert file_delete(dir) == Ok(())
+  assert file.delete(dir) == Ok(())
 }
