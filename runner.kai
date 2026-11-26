@@ -13,6 +13,8 @@ import uuid
 
 import path
 
+import fs.file
+
 pub type Limits = { build_secs: Int, run_secs: Int, max_output: Int }
 
 pub type Tools = { launcher: String, kai: String, workdir: String }
@@ -103,7 +105,7 @@ fn launch(
 
 #[doc("Create `dir` along with any parents it is missing.")]
 pub fn make_dirs(dir: String) : Result[Unit, String] / File =
-  if dir == "" or file_exists(dir) {
+  if dir == "" or file.exists(dir) {
     Ok(())
   } else {
     match make_dirs(path.dirname(dir)) {
@@ -112,7 +114,7 @@ pub fn make_dirs(dir: String) : Result[Unit, String] / File =
     }
   }
 
-fn new_job(t: Tools, source: String) : Result[String, String] / File + Random {
+fn new_job(t: Tools, source: String) : Result[String, String] / File + SecureRandom {
   let dir = "#{t.workdir}/job-#{uuid.v4()}"
   match dir_create_dir(dir) {
     Err(e) -> Err("cannot create job directory: #{e}")
@@ -192,7 +194,7 @@ pub fn compile_and_run(
   t: Tools,
   lim: Limits,
   source: String
-) : JobResult / File + Random + Process + Spawn + Clock = match new_job(t, source) {
+) : JobResult / File + SecureRandom + Process + Spawn + Clock = match new_job(t, source) {
   Err(e) -> internal(e)
   Ok(dir) -> {
     let built = launch(
@@ -217,7 +219,7 @@ pub fn format(
   t: Tools,
   lim: Limits,
   source: String
-) : Result[String, String] / File + Random + Process + Spawn + Clock = match new_job(t, source) {
+) : Result[String, String] / File + SecureRandom + Process + Spawn + Clock = match new_job(t, source) {
   Err(e) -> Err("playground: #{e}")
   Ok(dir) -> {
     let o = launch(t, dir, "build", [t.kai, "fmt", "main.kai"], lim.build_secs, lim.max_output)

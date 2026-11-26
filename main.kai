@@ -109,7 +109,7 @@ pub fn job_json(r: JobResult) : String {
 
 pub fn source_of(req: http.Request) : Result[String, http.Response] = match json_decode(req.body) {
   None -> Err(failure(400, "the request body is not JSON"))
-  Some(v) -> match as_string(get(v, "body")) {
+  Some(v) -> match option.and_then(get(v, "body"), as_string) {
     None -> Err(failure(400, "the request has no \"body\" string"))
     Some(src) ->
       if string_length(src) > MAX_SOURCE_BYTES {
@@ -126,7 +126,7 @@ pub fn cache_key(src: String) : String = hex.encode(sha256(http.string_to_bytes(
 fn compile(
   s: Server,
   src: String
-) : http.Response / Actor[Reply] + File + Random + Process + Spawn + Clock {
+) : http.Response / Actor[Reply] + File + SecureRandom + Process + Spawn + Clock {
   let key = cache_key(src)
   Actor.send(s.cache, Lookup(key, Actor.self()))
   match Actor.receive() {
@@ -152,7 +152,7 @@ fn compile(
 fn fmt(
   s: Server,
   src: String
-) : http.Response / Actor[Reply] + File + Random + Process + Spawn + Clock {
+) : http.Response / Actor[Reply] + File + SecureRandom + Process + Spawn + Clock {
   Actor.send(s.gate, Acquire(Actor.self()))
   match Actor.receive() {
     Granted -> {
@@ -170,7 +170,7 @@ fn fmt(
 pub fn route(
   s: Server,
   req: http.Request
-) : http.Response / Actor[Reply] + File + Random + Process + Spawn + Clock = match (
+) : http.Response / Actor[Reply] + File + SecureRandom + Process + Spawn + Clock = match (
   req.method,
   req.url
 ) {
@@ -207,7 +207,7 @@ pub fn send_all(c: Conn, data: [Int]) : Unit / NetTcp = match data {
 pub fn serve_conn(
   s: Server,
   c: Conn
-) : Unit / Actor[Reply] + NetTcp + Stdout + File + Random + Process + Spawn + Clock {
+) : Unit / Actor[Reply] + NetTcp + Stdout + File + SecureRandom + Process + Spawn + Clock {
   let resp = match http.read_request(c, MAX_REQUEST_BYTES) {
     Err(_) -> failure(400, "bad request")
     Ok(req) -> {
@@ -225,7 +225,7 @@ pub fn drain_done(live: Int) : Int / Actor[ConnMsg] = match Actor.receive_timeou
   Some(ConnDone) -> drain_done(live - 1)
 }
 
-fn accept_loop(s: Server, l: Listener, live: Int) : Unit / Actor[ConnMsg] + NetTcp + Spawn =
+fn accept_loop(s: Server, l: Listener, live: Int) : Unit / Actor[ConnMsg] + NetTcp + Stdout + File + SecureRandom + Process + Spawn + Clock =
   match NetTcp.accept(l) {
     Err(_) -> accept_loop(s, l, live)
     Ok(c) -> {
@@ -270,7 +270,7 @@ fn setting(name: String, fallback: String) : String / Env = match Env.get(name) 
 fn int_setting(name: String, fallback: Int) : Int / Env =
   string_to_int(setting(name, "")) |> unwrap_or(fallback)
 
-pub fn main() : Int / Stdout + Env + NetTcp + Spawn + Process + Clock + File + Random {
+pub fn main() : Int / Stdout + Env + NetTcp + Spawn + Process + Clock + File + SecureRandom {
   let tools = Tools {
     launcher: setting("PLAYGROUND_LAUNCHER", "sandbox/none.sh"),
     kai: setting("PLAYGROUND_KAI", "kai"),
